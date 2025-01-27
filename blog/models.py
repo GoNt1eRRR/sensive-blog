@@ -1,6 +1,91 @@
 from django.db import models
 from django.urls import reverse
 from django.contrib.auth.models import User
+from django.db.models import Count, Prefetch
+
+
+class PostQuerySet(models.QuerySet):
+    def with_related_data(self):
+        return (
+            self
+            .select_related('author')
+            .prefetch_related(
+                Prefetch(
+                    'comments',
+                    queryset=Comment.objects.select_related('author')
+                ),
+                Prefetch('tags', queryset=Tag.objects.with_posts_count()),
+            )
+            .annotate(
+                comments_count=Count('comments', distinct=True),
+                likes_count=Count('likes', distinct=True)
+            )
+        )
+
+    def popular(self):
+        return self.annotate(likes_count=Count('likes')).order_by('-likes_count')
+
+    def fresh(self):
+        return self.annotate(comments_count=Count('comments')).order_by('-published_at')
+
+    def prefetch_related_author(self):
+        return self.select_related('author').prefetch_related(
+            Prefetch('tags', queryset=Tag.objects.popular())
+        )
+
+    def fetch_with_comments_count(self):
+        posts_ids = [post.id for post in self]
+        posts_with_comments = (
+            Post.objects
+            .filter(id__in=posts_ids)
+            .annotate(comments__count=Count('comments'))
+        )
+        ids_and_comments = posts_with_comments.values_list('id', 'comments__count')
+        count_for_id = dict(ids_and_comments)
+
+        for post in self:
+            post.comments__count = count_for_id[post.id]
+
+        return self
+
+
+class PostManager(models.Manager):
+    def get_queryset(self):
+        return PostQuerySet(self.model, using=self._db)
+
+    def with_related_data(self):
+        return self.get_queryset().with_related_data()
+
+    def popular(self):
+        return self.get_queryset().popular()
+
+    def fresh(self):
+        return self.get_queryset().fresh()
+
+    def prefetch_related_author(self):
+        return self.get_queryset().prefetch_related_author()
+
+    def fetch_with_comments_count(self):
+        return self.get_queryset().fetch_with_comments_count()
+
+
+class TagQuerySet(models.QuerySet):
+    def with_posts_count(self):
+        return self.annotate(posts_count=Count('posts'))
+
+    def popular(self):
+        return self.with_posts_count().order_by('-posts_count')
+
+
+class TagManager(models.Manager):
+    def get_queryset(self):
+        return TagQuerySet(self.model, using=self._db)
+
+    def with_posts_count(self):
+        return self.get_queryset().with_posts_count()
+
+    def popular(self):
+        return self.get_queryset().popular()
 
 
 class Post(models.Model):
@@ -25,6 +110,8 @@ class Post(models.Model):
         related_name='posts',
         verbose_name='Теги')
 
+    objects = PostManager()
+
     def __str__(self):
         return self.title
 
@@ -39,6 +126,8 @@ class Post(models.Model):
 
 class Tag(models.Model):
     title = models.CharField('Тег', max_length=20, unique=True)
+
+    objects = TagManager()
 
     def __str__(self):
         return self.title
@@ -58,6 +147,7 @@ class Tag(models.Model):
 class Comment(models.Model):
     post = models.ForeignKey(
         'Post',
+        related_name='comments',
         on_delete=models.CASCADE,
         verbose_name='Пост, к которому написан')
     author = models.ForeignKey(
